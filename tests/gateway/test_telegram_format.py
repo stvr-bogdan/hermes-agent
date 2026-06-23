@@ -503,6 +503,15 @@ class TestFormatMessageBlockquote:
         assert "\\*" not in result  # asterisks in prefix must not be escaped
         assert "\\>" not in result  # > in prefix must not be escaped
 
+    def test_expandable_blockquote_continuation_end_marker(self, adapter):
+        """A plain > final line may close an expandable quote started by **>."""
+        result = adapter.format_message("**> First line\n> search_files: telegram*||")
+        assert result.splitlines() == [
+            "**> First line",
+            "> search\\_files: telegram\\*||",
+        ]
+        assert "\\|\\|" not in result
+
     def test_single_asterisk_gt_not_blockquote(self, adapter):
         """Single asterisk before > should not be treated as blockquote prefix."""
         result = adapter.format_message("*> not a quote")

@@ -3133,6 +3133,73 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
         return True
 
+    def _is_telegram_auto_title_topic(self, source: SessionSource) -> bool:
+        """True for Telegram topic sessions whose title may follow the session title.
+
+        Private-chat topic mode uses the persistent topic-binding table and is
+        gated by ``_is_telegram_topic_lane``. Telegram forum supergroup topics
+        are already isolated by ``thread_id`` in the normal session key, so they
+        can use the same first-exchange auto-title callback without opting into
+        DM topic mode. The General topic is intentionally excluded: it is a
+        lobby/default lane, not a user-created session topic.
+        """
+        if source.platform != Platform.TELEGRAM or not source.thread_id:
+            return False
+        if self._is_telegram_topic_lane(source):
+            return True
+        if source.chat_type != "group":
+            return False
+        tid = str(source.thread_id or "")
+        return bool(tid) and tid not in self._TELEGRAM_GENERAL_TOPIC_IDS
+
+    async def _handle_telegram_new_topic_command(self, event: MessageEvent) -> Optional[Union[str, EphemeralReply]]:
+        """Create a fresh Telegram forum topic for ``/new`` when possible."""
+        source = event.source
+        if source.platform != Platform.TELEGRAM or source.chat_type not in {"dm", "group"}:
+            return None
+        if not source.chat_id:
+            return None
+        adapter = self.adapters.get(source.platform) if getattr(self, "adapters", None) else None
+        create_thread = getattr(adapter, "create_handoff_thread", None) if adapter is not None else None
+        if not callable(create_thread):
+            return None
+
+        topic_name = "New session"
+        try:
+            new_thread_id = await create_thread(str(source.chat_id), topic_name)
+        except Exception:
+            logger.debug("Telegram /new topic creation failed", exc_info=True)
+            return None
+        if not new_thread_id:
+            return None
+
+        new_source = dataclasses.replace(
+            source,
+            thread_id=str(new_thread_id),
+            chat_topic=topic_name,
+        )
+        try:
+            new_entry = self.session_store.get_or_create_session(new_source, force_new=True)
+            self._cache_session_source(new_entry.session_key, new_source)
+            if self._is_telegram_topic_lane(new_source):
+                self._record_telegram_topic_binding(new_source, new_entry)
+        except Exception:
+            logger.debug("Failed to pre-create Telegram /new topic session", exc_info=True)
+
+        try:
+            await adapter.send(
+                str(source.chat_id),
+                "Новая сессия. Напиши сюда первое сообщение — переименую топик по контексту.",
+                metadata={"thread_id": str(new_thread_id)},
+            )
+        except Exception:
+            logger.debug("Failed to send Telegram /new topic intro", exc_info=True)
+
+        return EphemeralReply(
+            "Создал топик `New session`. Первое сообщение в нём станет стартом новой сессии, "
+            "и топик переименуется по контексту."
+        )
+
     _TELEGRAM_LOBBY_REMINDER_COOLDOWN_S = 30.0
 
     def _should_send_telegram_lobby_reminder(self, source: SessionSource) -> bool:
@@ -7656,6 +7723,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # doesn't get re-processed as a user message after the
             # interrupt completes.
             if _cmd_def_inner and _cmd_def_inner.name == "new":
+                telegram_topic_result = await self._handle_telegram_new_topic_command(event)
+                if telegram_topic_result is not None:
+                    return telegram_topic_result
                 # Clear any pending messages so the old text doesn't replay
                 await self._interrupt_and_clear_session(
                     _quick_key,
@@ -8055,6 +8125,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     break
 
         if canonical == "new":
+            telegram_topic_result = await self._handle_telegram_new_topic_command(event)
+            if telegram_topic_result is not None:
+                return telegram_topic_result
             if self._is_telegram_topic_root_lobby(source):
                 return self._telegram_topic_root_new_message()
             async def _do_reset():
@@ -11493,14 +11566,68 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cleaned = cleaned[:117].rstrip() + "..."
         return cleaned
 
+    def _telegram_topic_rename_key(self, source: SessionSource) -> Optional[str]:
+        """Stable key for the per-topic "already auto-renamed" guard."""
+        if source.platform != Platform.TELEGRAM or not source.chat_id or not source.thread_id:
+            return None
+        return f"{source.platform.value}:{source.chat_id}:{source.thread_id}"
+
+    def _telegram_topic_rename_state_path(self) -> Path:
+        return _hermes_home / "telegram_topic_renames.json"
+
+    def _telegram_topic_already_auto_renamed(self, source: SessionSource) -> bool:
+        """Return True once Hermes has auto-renamed this Telegram topic.
+
+        Topic auto-title can be invoked again after compression, /new, or a
+        gateway restart because the new session may not have a title yet. The
+        user-visible forum topic, however, should only be auto-renamed once:
+        from the first real message in that topic. Persisting this tiny guard
+        prevents later short follow-ups from clobbering a good topic title.
+        """
+        key = self._telegram_topic_rename_key(source)
+        if not key:
+            return False
+        try:
+            data = json.loads(self._telegram_topic_rename_state_path().read_text())
+        except Exception:
+            return False
+        renamed = data.get("renamed_topics") if isinstance(data, dict) else None
+        return isinstance(renamed, dict) and key in renamed
+
+    def _mark_telegram_topic_auto_renamed(self, source: SessionSource, title: str) -> None:
+        key = self._telegram_topic_rename_key(source)
+        if not key:
+            return
+        path = self._telegram_topic_rename_state_path()
+        try:
+            data = json.loads(path.read_text()) if path.exists() else {}
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        renamed = data.setdefault("renamed_topics", {})
+        if not isinstance(renamed, dict):
+            renamed = {}
+            data["renamed_topics"] = renamed
+        renamed[key] = {
+            "chat_id": str(source.chat_id),
+            "thread_id": str(source.thread_id),
+            "title": self._sanitize_telegram_topic_title(title),
+            "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        }
+        try:
+            atomic_json_write(path, data)
+        except Exception:
+            logger.debug("Failed to persist Telegram topic rename guard", exc_info=True)
+
     async def _rename_telegram_topic_for_session_title(
         self,
         source: SessionSource,
         session_id: str,
         title: str,
     ) -> None:
-        """Best-effort rename of a Telegram DM topic when Hermes auto-titles a session."""
-        if not self._is_telegram_topic_lane(source) or not source.chat_id or not source.thread_id:
+        """Best-effort rename of a Telegram topic when Hermes auto-titles a session."""
+        if not self._is_telegram_auto_title_topic(source) or not source.chat_id or not source.thread_id:
             return
 
         # Operator can fully disable per-topic auto-rename via
@@ -11531,6 +11658,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if isinstance(operator_topic, dict):
                     return
 
+        if source.chat_type == "group":
+            platform_cfg = (
+                self.config.platforms.get(source.platform)
+                if getattr(self, "config", None) and getattr(self.config, "platforms", None)
+                else None
+            )
+            extra = getattr(platform_cfg, "extra", None) or {}
+            for chat_entry in extra.get("group_topics", []) or []:
+                if str(chat_entry.get("chat_id", "")) != str(source.chat_id):
+                    continue
+                for topic in chat_entry.get("topics", []) or []:
+                    tid = topic.get("thread_id")
+                    if tid is not None and str(tid) == str(source.thread_id):
+                        return
+                break
+
+        if self._telegram_topic_already_auto_renamed(source):
+            return
+
         session_db = getattr(self, "_session_db", None)
         if session_db is not None:
             try:
@@ -11555,6 +11701,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     thread_id=str(source.thread_id),
                     name=topic_name,
                 )
+                self._mark_telegram_topic_auto_renamed(source, topic_name)
                 return
 
             bot = getattr(adapter, "_bot", None)
@@ -11575,6 +11722,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_thread_id=source.thread_id,
                     name=topic_name,
                 )
+            self._mark_telegram_topic_auto_renamed(source, topic_name)
         except Exception:
             logger.debug("Failed to rename Telegram topic for auto-generated title", exc_info=True)
 
@@ -11608,7 +11756,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         title: str,
     ) -> None:
         """Schedule a topic rename from the auto-title background thread."""
-        if not title or not self._is_telegram_topic_lane(source):
+        if not title or not self._is_telegram_auto_title_topic(source):
             return
         if self._telegram_topic_auto_rename_disabled(source):
             return
@@ -14645,38 +14793,129 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         long_tool_hint_fired = [False]
         _LONG_TOOL_THRESHOLD_S = 30.0
 
+        # Telegram has rich blockquote support, so render the editable technical
+        # progress bubble as sections instead of a bare chronological dump:
+        # Todo (when present) → collapsed Processing quote → Memory updated.
+        # Other platforms keep the historical one-line-per-tool behavior.
+        _grouped_progress_sections = source.platform == Platform.TELEGRAM
+        _progress_todos: list[dict] = []
+        _memory_update_lines: list[str] = []
+        _pending_memory_args: list[dict] = []
+
+        def _quote_lines(lines: list[str], *, expandable: bool = False) -> list[str]:
+            if not lines:
+                return []
+            rendered: list[str] = []
+            for idx, line in enumerate(lines):
+                # Telegram MarkdownV2 expandable quotes are one quote block: the
+                # first quoted line carries the empty-bold marker (``**>``),
+                # continuation lines are plain ``>``, and only the final line
+                # closes with ``||``. Prefixing every line with ``**>`` renders
+                # literal ``*>`` fragments on Telegram instead of one collapsed
+                # Processing block.
+                prefix = "**>" if expandable and idx == 0 else ">"
+                suffix = "||" if expandable and idx == len(lines) - 1 else ""
+                rendered.append(f"{prefix} {line}{suffix}")
+            return rendered
+
+        def _format_todo_item(todo_item: dict) -> str:
+            text = str(todo_item.get("content") or "").strip() or "задача"
+            bullet = f"• {text}"
+            status = str(todo_item.get("status") or "").lower()
+            return f"~~{bullet}~~" if status in {"completed", "cancelled"} else bullet
+
+        def _memory_action_line(memory_args: dict) -> str | None:
+            if not isinstance(memory_args, dict):
+                return None
+            action = str(memory_args.get("action") or "").lower()
+            target = str(memory_args.get("target") or "").lower()
+            content = str(memory_args.get("content") or "").strip()
+            old_text = str(memory_args.get("old_text") or "").strip()
+            if action == "add":
+                label = "добавлено"
+            elif action == "replace":
+                label = "обновлено"
+            elif action == "remove":
+                label = "удалено"
+            else:
+                label = action or "изменено"
+            scope = "профиль пользователя" if target == "user" else "память"
+            detail = content or old_text
+            if detail:
+                detail = detail.replace("\n", " ")
+                if len(detail) > 120:
+                    detail = detail[:117] + "..."
+                return f"• {label}: {scope} — {detail}"
+            return f"• {label}: {scope}"
+
+        def _render_grouped_progress_text(processing_lines: list) -> str:
+            sections: list[str] = []
+            if _progress_todos:
+                sections.append(f"📋 Todo — {len(_progress_todos)} task(s):")
+                sections.extend(_quote_lines([_format_todo_item(t) for t in _progress_todos]))
+            if processing_lines:
+                if sections:
+                    sections.append("")
+                sections.append("⚙️ Processing...")
+                sections.extend(_quote_lines([str(line) for line in processing_lines], expandable=True))
+            if _memory_update_lines:
+                if sections:
+                    sections.append("")
+                sections.append("🧠 Memory updated:")
+                sections.extend(_quote_lines(_memory_update_lines))
+            return "\n".join(sections)
+
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
             if not progress_queue or not _run_still_current():
                 return
 
-            # First-touch onboarding: the first time a tool takes longer than
-            # _LONG_TOOL_THRESHOLD_S during a run that's streaming every tool
-            # (progress_mode == "all"), append a one-time hint suggesting
-            # /verbose.  We only fire when (a) the user hasn't seen the hint
-            # before and (b) /verbose is actually usable on this platform
-            # (gateway gate must be open).  The CLI has its own trigger.
-            if event_type == "tool.completed" and not long_tool_hint_fired[0]:
-                try:
-                    duration = kwargs.get("duration") or 0
-                    if duration >= _LONG_TOOL_THRESHOLD_S and progress_mode == "all":
-                        from agent.onboarding import (
-                            TOOL_PROGRESS_FLAG,
-                            is_seen,
-                            mark_seen,
-                            tool_progress_hint_gateway,
-                        )
-                        _cfg = _load_gateway_config()
-                        gate_on = is_truthy_value(
-                            cfg_get(_cfg, "display", "tool_progress_command"),
-                            default=False,
-                        )
-                        if gate_on and not is_seen(_cfg, TOOL_PROGRESS_FLAG):
-                            long_tool_hint_fired[0] = True
-                            progress_queue.put(tool_progress_hint_gateway())
-                            mark_seen(_hermes_home / "config.yaml", TOOL_PROGRESS_FLAG)
-                except Exception as _hint_err:
-                    logger.debug("tool-progress onboarding hint failed: %s", _hint_err)
+            if event_type == "tool.completed":
+                if _grouped_progress_sections and tool_name == "todo":
+                    try:
+                        result_data = json.loads(str(kwargs.get("result") or "{}"))
+                    except Exception:
+                        result_data = None
+                    if isinstance(result_data, dict) and isinstance(result_data.get("todos"), list):
+                        _progress_todos[:] = [
+                            t for t in result_data.get("todos", []) if isinstance(t, dict)
+                        ]
+                        progress_queue.put(("__refresh__",))
+                    return
+                if _grouped_progress_sections and tool_name == "memory":
+                    try:
+                        result_data = json.loads(str(kwargs.get("result") or "{}"))
+                    except Exception:
+                        result_data = None
+                    if isinstance(result_data, dict) and result_data.get("success"):
+                        memory_args = _pending_memory_args.pop(0) if _pending_memory_args else {}
+                        line = _memory_action_line(memory_args)
+                        if line and line not in _memory_update_lines:
+                            _memory_update_lines.append(line)
+                            progress_queue.put(("__refresh__",))
+                    return
+
+                if not long_tool_hint_fired[0]:
+                    try:
+                        duration = kwargs.get("duration") or 0
+                        if duration >= _LONG_TOOL_THRESHOLD_S and progress_mode == "all":
+                            from agent.onboarding import (
+                                TOOL_PROGRESS_FLAG,
+                                is_seen,
+                                mark_seen,
+                                tool_progress_hint_gateway,
+                            )
+                            _cfg = _load_gateway_config()
+                            gate_on = is_truthy_value(
+                                cfg_get(_cfg, "display", "tool_progress_command"),
+                                default=False,
+                            )
+                            if gate_on and not is_seen(_cfg, TOOL_PROGRESS_FLAG):
+                                long_tool_hint_fired[0] = True
+                                progress_queue.put(tool_progress_hint_gateway())
+                                mark_seen(_hermes_home / "config.yaml", TOOL_PROGRESS_FLAG)
+                    except Exception as _hint_err:
+                        logger.debug("tool-progress onboarding hint failed: %s", _hint_err)
                 return
 
             # "_thinking" is assistant scratch text between tool calls.  It
@@ -14700,6 +14939,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
             if event_type not in {"tool.started",}:
+                return
+
+            if _grouped_progress_sections and tool_name == "memory":
+                if isinstance(args, dict):
+                    _pending_memory_args.append(dict(args))
+                return
+            if _grouped_progress_sections and tool_name == "todo":
                 return
 
             # Suppress tool-progress bubbles once the user has sent `stop`.
@@ -14747,7 +14993,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 _progress_adapter = None
             if (
-                getattr(_progress_adapter, "supports_code_blocks", False)
+                not _grouped_progress_sections
+                and getattr(_progress_adapter, "supports_code_blocks", False)
                 and tool_name == "terminal"
                 and isinstance(args, dict)
                 and isinstance(args.get("command"), str)
@@ -14927,6 +15174,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return await adapter.edit_message(**kwargs)
 
             def _progress_text(lines: list) -> str:
+                if _grouped_progress_sections:
+                    return _render_grouped_progress_text(lines)
                 return "\n".join(str(line) for line in lines)
 
             def _split_progress_groups(lines: list) -> list[list]:
@@ -15032,6 +15281,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if progress_lines:
                             progress_lines[-1] = f"{base_msg} (×{count + 1})"
                         msg = progress_lines[-1] if progress_lines else base_msg
+                    elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__refresh__":
+                        msg = progress_lines[-1] if progress_lines else ""
                     elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
                         # Content bubble just landed on the platform — close off
                         # the current tool-progress bubble so the next tool
@@ -15075,7 +15326,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                     if can_edit and progress_msg_id is not None:
                         # Try to edit the existing progress message
-                        full_text = "\n".join(progress_lines)
+                        full_text = _progress_text(progress_lines)
                         result = await _edit_progress_message(progress_msg_id, full_text)
                         if not result.success:
                             _err = (getattr(result, "error", "") or "").lower()
@@ -15115,7 +15366,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else:
                         if can_edit:
                             # First tool: send all accumulated text as new message
-                            full_text = "\n".join(progress_lines)
+                            full_text = _progress_text(progress_lines)
                             result = await adapter.send(
                                 chat_id=source.chat_id,
                                 content=full_text,
@@ -15154,6 +15405,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 if progress_lines:
                                     progress_lines[-1] = f"{base_msg} (×{count + 1})"
                                     await _roll_progress_overflow_if_needed()
+                            elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__refresh__":
+                                await _roll_progress_overflow_if_needed()
                             elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
                                 # Content-bubble marker during drain: close off
                                 # the current progress bubble and start a fresh
@@ -16228,7 +16481,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "api_mode": getattr(agent, "api_mode", None),
                         } if agent else None,
                     }
-                    if self._is_telegram_topic_lane(source):
+                    if self._is_telegram_auto_title_topic(source):
                         maybe_auto_title_kwargs["title_callback"] = lambda title: self._schedule_telegram_topic_title_rename(
                             source,
                             effective_session_id,

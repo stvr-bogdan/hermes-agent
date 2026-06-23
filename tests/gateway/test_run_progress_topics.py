@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib
+import json
 import sys
 import time
 import types
@@ -138,6 +139,41 @@ class FakeAgent:
             time.sleep(0.35)
             cb("tool.started", "browser_navigate", "https://example.com", {})
             time.sleep(0.35)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class GroupedSectionsAgent:
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb(
+            "tool.completed",
+            "todo",
+            result=json.dumps(
+                {
+                    "todos": [
+                        {"content": "Inspect progress formatting", "status": "completed"},
+                        {"content": "Restart gateway", "status": "pending"},
+                    ]
+                }
+            ),
+        )
+        cb("tool.started", "terminal", "pwd", {})
+        cb(
+            "tool.started",
+            "memory",
+            args={"action": "add", "target": "memory", "content": "quote formatting preference"},
+        )
+        cb("tool.completed", "memory", result=json.dumps({"success": True}))
+        time.sleep(0.35)
         return {
             "final_response": "done",
             "messages": [],
@@ -284,13 +320,70 @@ async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_pa
     assert adapter.sent == [
         {
             "chat_id": "-1001",
-            "content": '💻 terminal: "pwd"',
+            "content": '⚙️ Processing...\n**> 💻 terminal: "pwd"||',
             "reply_to": None,
             "metadata": {"thread_id": "17585"},
         }
     ]
     assert adapter.edits
+    assert adapter.edits[-1]["content"].splitlines() == [
+        "⚙️ Processing...",
+        '**> 💻 terminal: "pwd"',
+        '> ⚙️ browser_navigate: "https://example.com"||',
+    ]
     assert all(call["metadata"] == {"thread_id": "17585"} for call in adapter.typing)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_grouped_progress_renders_todo_memory_as_regular_quotes(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = GroupedSectionsAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    import tools.terminal_tool  # noqa: F401 - register terminal emoji for this fake-agent test
+
+    adapter = ProgressCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-grouped-sections",
+        session_key="agent:main:telegram:group:-1001:17585",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent
+    final_content = (adapter.edits[-1] if adapter.edits else adapter.sent[-1])["content"]
+    assert final_content.splitlines() == [
+        "📋 Todo — 2 task(s):",
+        "> ~~• Inspect progress formatting~~",
+        "> • Restart gateway",
+        "",
+        "⚙️ Processing...",
+        '**> 💻 terminal: "pwd"||',
+        "",
+        "🧠 Memory updated:",
+        "> • добавлено: память — quote formatting preference",
+    ]
+    assert "**>" not in "\n".join(final_content.splitlines()[:3])
+    assert "||" not in "\n".join(final_content.splitlines()[:3] + final_content.splitlines()[-2:])
 
 
 @pytest.mark.asyncio
@@ -562,8 +655,10 @@ def test_all_mode_no_truncation_when_preview_fits(monkeypatch, tmp_path):
     assert result["final_response"] == "done"
     assert adapter.sent
     content = adapter.sent[0]["content"]
-    # With a 200-char cap, the 165-char command should NOT be truncated
-    assert "..." not in content, f"Preview was truncated when it shouldn't be: {content}"
+    # With a 200-char cap, the 165-char command should NOT be truncated.
+    # Ignore the section header ellipsis in "Processing...".
+    progress_body = "\n".join(content.splitlines()[1:])
+    assert "..." not in progress_body, f"Preview was truncated when it shouldn't be: {content}"
 
 
 class CommentaryAgent:
@@ -1353,11 +1448,10 @@ class TerminalCommandAgent:
 
 @pytest.mark.asyncio
 async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path):
-    """Terminal progress on a markdown-capable (supports_code_blocks) gateway
-    renders a bare fenced code block — no language tag (Slack mrkdwn would print
-    'bash' as a literal first code line).  In non-verbose ("all"/"new") mode the
-    command is collapsed to a single line capped at tool_preview_length so a long
-    or multi-line command doesn't render as a huge block (#42634)."""
+    """Terminal progress on a markdown-capable non-Telegram gateway renders a
+    bare fenced code block — no language tag (Slack mrkdwn would print 'bash' as
+    a literal first code line). Telegram uses grouped progress instead and keeps
+    terminal commands as ordinary compact preview lines."""
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
 
     fake_dotenv = types.ModuleType("dotenv")
@@ -1369,16 +1463,16 @@ async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
     import tools.terminal_tool  # noqa: F401 - register terminal emoji
 
-    adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
+    adapter = CodeBlockProgressAdapter(platform=Platform.SLACK)
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
 
     source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="12345",
-        chat_type="dm",
+        platform=Platform.SLACK,
+        chat_id="C12345",
+        chat_type="channel",
         thread_id=None,
     )
 
@@ -1388,7 +1482,7 @@ async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path
         history=[],
         source=source,
         session_id="sess-terminal-code-block",
-        session_key="agent:main:telegram:dm:12345",
+        session_key="agent:main:slack:channel:C12345",
     )
 
     assert result["final_response"] == "done"
@@ -1408,9 +1502,9 @@ async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path
 
 @pytest.mark.asyncio
 async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_path):
-    """Verbose mode on a markdown-capable gateway renders the FULL multi-line
-    command in a bare fenced block (no truncation, no 'bash' tag).  This is the
-    parity guarantee for #42634: verbose keeps full detail, non-verbose caps."""
+    """Verbose mode on a markdown-capable non-Telegram gateway renders the FULL
+    multi-line command in a bare fenced block. Telegram grouped progress keeps
+    commands as ordinary compact lines instead."""
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "verbose")
 
     fake_dotenv = types.ModuleType("dotenv")
@@ -1422,16 +1516,16 @@ async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_pat
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
     import tools.terminal_tool  # noqa: F401 - register terminal emoji
 
-    adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
+    adapter = CodeBlockProgressAdapter(platform=Platform.SLACK)
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
 
     source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="12345",
-        chat_type="dm",
+        platform=Platform.SLACK,
+        chat_id="C12345",
+        chat_type="channel",
         thread_id=None,
     )
 
@@ -1441,7 +1535,7 @@ async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_pat
         history=[],
         source=source,
         session_id="sess-terminal-code-block-verbose",
-        session_key="agent:main:telegram:dm:12345",
+        session_key="agent:main:slack:channel:C12345",
     )
 
     assert result["final_response"] == "done"
@@ -1559,9 +1653,10 @@ async def test_consecutive_terminal_progress_collapses_headers(monkeypatch, tmp_
         call["content"] for call in adapter.edits
     ]
     final = max(contents, key=len) if contents else ""
-    # All four commands present as code blocks.
+    # Telegram progress renders as a single collapsed Processing block.
+    assert final.startswith("⚙️ Processing...\n**>")
+    assert final.endswith("||")
     for cmd in ("echo one", "echo two", "echo three", "echo four"):
         assert cmd in final
-    # Exactly TWO terminal headers: one for the first run of three calls,
-    # one for the terminal call after web_search broke the streak.
-    assert final.count("terminal\n```") == 2
+    assert final.count("💻 terminal:") == 4
+    assert "⚙️ web_search:" in final

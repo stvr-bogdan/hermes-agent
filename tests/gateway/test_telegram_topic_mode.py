@@ -4,6 +4,7 @@ Topic mode makes the root Telegram DM a system lobby while user-created
 Telegram topics act as independent Hermes session lanes.
 """
 
+import json
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -154,6 +155,7 @@ def _make_runner(session_db=None):
     runner._clear_session_boundary_security_state = MagicMock()
     runner._set_session_reasoning_override = MagicMock()
     runner._format_session_info = MagicMock(return_value="")
+    runner._cache_session_source = MagicMock()
     return runner
 
 
@@ -384,6 +386,102 @@ async def test_new_inside_telegram_topic_resets_current_topic_with_parallel_tip(
     assert "parallel work" in result
     assert "All Messages" in result
     runner.session_store.reset_session.assert_called_once_with(topic_key)
+
+
+@pytest.mark.asyncio
+async def test_new_in_telegram_group_creates_fresh_topic_session(tmp_path, monkeypatch):
+    import gateway.run as gateway_run
+
+    runner = _make_runner(session_db=SessionDB(db_path=tmp_path / "state.db"))
+    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter.create_handoff_thread = AsyncMock(return_value="777")
+    adapter.send = AsyncMock()
+
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    result = await runner._handle_message(_make_group_event("/new", thread_id="1002"))
+
+    adapter.create_handoff_thread.assert_awaited_once_with("-100123", "New session")
+    adapter.send.assert_awaited_once()
+    send_args, send_kwargs = adapter.send.await_args
+    assert send_args[:2] == ("-100123", "Новая сессия. Напиши сюда первое сообщение — переименую топик по контексту.")
+    assert send_kwargs["metadata"] == {"thread_id": "777"}
+    runner.session_store.get_or_create_session.assert_called()
+    created_source = runner.session_store.get_or_create_session.call_args.args[0]
+    assert created_source.chat_type == "group"
+    assert created_source.thread_id == "777"
+    assert runner.session_store.get_or_create_session.call_args.kwargs["force_new"] is True
+    runner.session_store.reset_session.assert_not_called()
+    assert "Создал топик `New session`" in str(result)
+
+
+@pytest.mark.asyncio
+async def test_group_topic_auto_title_rename_uses_edit_forum_topic(tmp_path):
+    runner = _make_runner(session_db=SessionDB(db_path=tmp_path / "state.db"))
+    bot = SimpleNamespace(edit_forum_topic=AsyncMock())
+    adapter = SimpleNamespace(_bot=bot)
+    runner.adapters[Platform.TELEGRAM] = adapter
+
+    await runner._rename_telegram_topic_for_session_title(
+        _make_group_source(thread_id="777"),
+        "sess-group-topic",
+        "Discuss market structure",
+    )
+
+    bot.edit_forum_topic.assert_awaited_once_with(
+        chat_id=-100123,
+        message_thread_id=777,
+        name="Discuss market structure",
+    )
+
+
+@pytest.mark.asyncio
+async def test_group_topic_auto_title_rename_only_happens_once_per_topic(tmp_path):
+    runner = _make_runner(session_db=SessionDB(db_path=tmp_path / "state.db"))
+    runner._telegram_topic_rename_state_path = lambda: tmp_path / "topic-renames.json"
+    bot = SimpleNamespace(edit_forum_topic=AsyncMock())
+    runner.adapters[Platform.TELEGRAM] = SimpleNamespace(_bot=bot)
+    source = _make_group_source(thread_id="777")
+
+    await runner._rename_telegram_topic_for_session_title(
+        source,
+        "sess-group-topic",
+        "First topic title",
+    )
+    await runner._rename_telegram_topic_for_session_title(
+        source,
+        "sess-after-compression",
+        "Later follow-up title",
+    )
+
+    bot.edit_forum_topic.assert_awaited_once_with(
+        chat_id=-100123,
+        message_thread_id=777,
+        name="First topic title",
+    )
+    state = json.loads((tmp_path / "topic-renames.json").read_text())
+    assert "telegram:-100123:777" in state["renamed_topics"]
+
+
+@pytest.mark.asyncio
+async def test_operator_declared_group_topic_is_not_auto_renamed(tmp_path):
+    runner = _make_runner(session_db=SessionDB(db_path=tmp_path / "state.db"))
+    runner.config.platforms[Platform.TELEGRAM].extra["group_topics"] = [
+        {"chat_id": "-100123", "topics": [{"thread_id": "92", "name": "Market"}]}
+    ]
+    bot = SimpleNamespace(edit_forum_topic=AsyncMock())
+    adapter = SimpleNamespace(_bot=bot)
+    runner.adapters[Platform.TELEGRAM] = adapter
+
+    await runner._rename_telegram_topic_for_session_title(
+        _make_group_source(thread_id="92"),
+        "sess-market",
+        "Should Not Rename",
+    )
+
+    bot.edit_forum_topic.assert_not_awaited()
 
 
 @pytest.mark.asyncio

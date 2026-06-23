@@ -5364,9 +5364,26 @@ class TelegramAdapter(BasePlatformAdapter):
         def _convert_blockquote(m):
             prefix = m.group(1)  # >, >>, >>>, **>, or **>> etc.
             content = m.group(2)
-            # Check if content ends with || (expandable blockquote end marker)
-            # In this case, preserve the trailing || unescaped for Telegram
-            if prefix.startswith('**') and content.endswith('||'):
+
+            def _previous_quote_block_has_expandable_start() -> bool:
+                """Return true when this plain ``>`` line continues a ``**>`` block."""
+                before = m.string[:m.start()]
+                for prev in reversed(before.splitlines()):
+                    stripped = prev.lstrip()
+                    if not stripped.startswith(">") and not stripped.startswith("**>"):
+                        break
+                    if stripped.startswith("**>"):
+                        return True
+                return False
+
+            # Check if content ends with || (expandable blockquote end marker).
+            # The opening line may use ``**>`` but continuation/final lines are
+            # plain ``>``; preserve the final marker when this line starts an
+            # expandable block or continues one. A standalone regular quote
+            # ending in pipes still escapes them as literal text.
+            if content.endswith('||') and (
+                prefix.startswith('**') or _previous_quote_block_has_expandable_start()
+            ):
                 return _ph(f'{prefix} {_escape_mdv2(content[:-2])}||')
             return _ph(f'{prefix} {_escape_mdv2(content)}')
 
@@ -5533,6 +5550,40 @@ class TelegramAdapter(BasePlatformAdapter):
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _telegram_require_mention_topics(self) -> set[tuple[Optional[str], str]]:
+        """Return chat/topic pairs where Telegram requires reply or @mention.
+
+        Accepts entries like ``-100123:92`` (chat + topic), ``-100123/92``,
+        or bare ``92`` to match that topic in any chat. ``None`` thread IDs are
+        normalized to Telegram's General topic id ``1`` by the caller.
+        """
+        raw = self.config.extra.get("require_mention_topics")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_REQUIRE_MENTION_TOPICS", "")
+        values = raw if isinstance(raw, list) else str(raw).split(",")
+
+        topics: set[tuple[Optional[str], str]] = set()
+        for value in values:
+            text = str(value).strip()
+            if not text:
+                continue
+            chat_id: Optional[str] = None
+            topic_id = text
+            for sep in (":", "/"):
+                if sep in text:
+                    chat_id, topic_id = (part.strip() for part in text.rsplit(sep, 1))
+                    break
+            if not topic_id:
+                logger.warning("[%s] Ignoring invalid Telegram require_mention_topics entry: %r", self.name, value)
+                continue
+            topics.add((chat_id or None, topic_id))
+        return topics
+
+    def _telegram_topic_requires_mention(self, chat_id: str, thread_id: Optional[int]) -> bool:
+        topic_id = str(thread_id) if thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
+        topics = self._telegram_require_mention_topics()
+        return (chat_id, topic_id) in topics or (None, topic_id) in topics
 
     def _telegram_ignored_threads(self) -> set[int]:
         raw = self.config.extra.get("ignored_threads")
@@ -6101,11 +6152,13 @@ class TelegramAdapter(BasePlatformAdapter):
         if allowed and chat_id_str not in allowed:
             return guest_mention
 
+        topic_requires_mention = self._telegram_topic_requires_mention(chat_id_str, thread_id)
+
         if guest_mention:
             return True
-        if chat_id_str in self._telegram_free_response_chats():
+        if not topic_requires_mention and chat_id_str in self._telegram_free_response_chats():
             return True
-        if not self._telegram_require_mention():
+        if not topic_requires_mention and not self._telegram_require_mention():
             return True
         if self._is_reply_to_bot(message):
             return True
@@ -7298,6 +7351,13 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
         if isinstance(allowed_topics, list):
             allowed_topics = ",".join(str(v) for v in allowed_topics)
         os.environ["TELEGRAM_ALLOWED_TOPICS"] = str(allowed_topics)
+    require_mention_topics = telegram_cfg.get("require_mention_topics")
+    if require_mention_topics is not None and not os.getenv("TELEGRAM_REQUIRE_MENTION_TOPICS"):
+        if isinstance(require_mention_topics, list):
+            require_mention_topics = ",".join(str(v) for v in require_mention_topics)
+        os.environ["TELEGRAM_REQUIRE_MENTION_TOPICS"] = str(require_mention_topics)
+    if require_mention_topics is not None:
+        extras.setdefault("require_mention_topics", require_mention_topics)
     ignored_threads = telegram_cfg.get("ignored_threads")
     if ignored_threads is not None and not os.getenv("TELEGRAM_IGNORED_THREADS"):
         if isinstance(ignored_threads, list):
